@@ -228,6 +228,26 @@ function showMainWindow() {
 	createWindow();
 }
 
+/**
+ * Ship adaptation (Корабль): the global shortcut toggles the panel — hide a
+ * visible window, bring back or create a hidden one. Hiding keeps the process
+ * (tray and global shortcut stay alive) and the renderer state; it never goes
+ * through the close handler, so unsaved editor work is safe.
+ */
+function toggleMainWindow() {
+	if (
+		mainWindow &&
+		!mainWindow.isDestroyed() &&
+		mainWindow.isVisible() &&
+		!mainWindow.isMinimized()
+	) {
+		mainWindow.hide();
+		return;
+	}
+
+	showMainWindow();
+}
+
 if (cliCommand) {
 	runCli(cliCommand);
 } else if (hasSingleInstanceLock) {
@@ -1388,7 +1408,7 @@ appReady?.then(async () => {
 	});
 
 	ipcMain.handle("update-global-shortcut", (_, binding: ShortcutBinding) => {
-		const success = registerOpenAppShortcut(binding, showMainWindow);
+		const success = registerOpenAppShortcut(binding, toggleMainWindow);
 		return { success };
 	});
 
@@ -1561,7 +1581,7 @@ appReady?.then(async () => {
 	// Native STT (whisper.cpp + forced alignment) — single instance per app.
 	registerSttIpc(ipcMain);
 
-	await loadAndRegisterGlobalShortcut(showMainWindow);
+	await loadAndRegisterGlobalShortcut(toggleMainWindow);
 
 	// --bench=<query>: run the export bench instead of the app. Opens the real
 	// editor window (same webPreferences, same preload) pointed at the bench
