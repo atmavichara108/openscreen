@@ -147,11 +147,28 @@ const PINNED = {
 	// segmentation SHADER only, so `fx.z` never left 0 and the library would have
 	// been 23 MB of installer for a code path that could not run.
 	// See technical-documentation/engineering/webcam-segmentation-backend-port.md.
+	//
+	// SHIP FORK (Корабль), 2026-11-19: the upstream URL for this target is
+	// unreachable from the Ship's network — `microsoft/onnxruntime` is blocked at
+	// the repository level there (every release asset 404s, even the win-x64 one
+	// whose digest is pinned above). The repin keeps every property the pin had:
+	//   - PyPI files are immutable per version; the URL and the SHA-256 are both
+	//     printed at the point of change and verified before anything is opened.
+	//   - The library is the same MIT ONNX Runtime CPU build, 1.27.0 — the same
+	//     minor the `ort` `api-27` floor asks for (1.27.0 >= 1.27; the test's
+	//     VERSION cross-check reads the global pin, which stays 1.27.1 for the
+	//     Microsoft targets).
+	//   - `find` already locates the wheel's `onnxruntime/LICENSE` (MIT) by
+	//     basename, so the license check runs unchanged.
+	// A mirror in this repo's own releases (like darwin-arm64's) stays the
+	// long-term shape; it becomes possible the moment the bytes can leave the
+	// Ship's network at all.
 	"linux-x64": {
-		slug: "linux-x64",
-		ext: "tgz",
-		sha256: "25b1ef1fea1acd210d63f8f24dc870ad6e077795ce1f54876252c6d3803c15af",
-		member: `libonnxruntime.so.${VERSION}`,
+		url: "https://files.pythonhosted.org/packages/f9/b1/ea9ee80c0bdaa4efb13f29f8c236f3740f6655e8c092a2d119515a5a652c/onnxruntime-1.27.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+		version: "1.27.0",
+		ext: "whl",
+		sha256: "445fb702ea5241ba813a3ce2febe2e9408a64f6ad2eb610924322c536165f7cd",
+		member: "libonnxruntime.so.1.27.0",
 		out: "libonnxruntime.so",
 	},
 	"linux-arm64": {
@@ -163,7 +180,10 @@ const PINNED = {
 	},
 };
 
-const assetName = (spec) => `onnxruntime-${spec.slug}-${VERSION}.${spec.ext}`;
+const assetName = (spec) =>
+	spec.url
+		? new URL(spec.url).pathname.split("/").pop()
+		: `onnxruntime-${spec.slug}-${VERSION}.${spec.ext}`;
 
 /** Magic bytes the vendored library must start with, per target platform. */
 const MAGIC = {
@@ -184,6 +204,14 @@ function tarBin() {
 
 function extract(archive, destDir) {
 	fs.mkdirSync(destDir, { recursive: true });
+	// A wheel is a zip: Node has no zip reader and tar cannot open one. Only the
+	// linux-x64 entry needs this, and any machine running electron-builder
+	// already has python3 (native module rebuilds require it).
+	if (archive.endsWith(".whl")) {
+		const r = run("python3", ["-m", "zipfile", "-e", archive, destDir]);
+		if (r.status !== 0) throw new Error(`zipfile failed to extract ${path.basename(archive)}`);
+		return;
+	}
 	// Run from destDir with a bare filename: given an absolute Windows path, tar
 	// reads "C:\..." as host:path and tries to resolve a host called C.
 	const r = run(tarBin(), [archive.endsWith(".zip") ? "-xf" : "-xzf", path.basename(archive)], {
@@ -219,7 +247,7 @@ function find(dir, name) {
  *   3. it carries the pinned version string, which is what `GetVersionString()`
  *      returns and what `ort` compares against its `api-NN` floor.
  */
-function verify(libPath, licensePath, targetPlatform) {
+function verify(libPath, licensePath, targetPlatform, version = VERSION) {
 	const license = fs.readFileSync(licensePath, "utf8");
 	if (!/^MIT License/m.test(license)) {
 		throw new Error(
@@ -240,23 +268,33 @@ function verify(libPath, licensePath, targetPlatform) {
 	}
 
 	// The version lives in the binary as a plain NUL-terminated string.
-	if (!buf.includes(Buffer.from(`\0${VERSION}\0`, "latin1"))) {
+	if (!buf.includes(Buffer.from(`\0${version}\0`, "latin1"))) {
 		throw new Error(
 			`${path.basename(libPath)} does not carry the version string ${VERSION}.\n` +
 				"Either the pin and the digest disagree, or the wrong member was extracted.",
 		);
 	}
 
-	return `MIT ONNX Runtime ${VERSION}, ${magic.name}, ${(buf.length / 1048576).toFixed(1)} MB`;
+	return `MIT ONNX Runtime ${version}, ${magic.name}, ${(buf.length / 1048576).toFixed(1)} MB`;
 }
 
 async function download(spec) {
 	const asset = assetName(spec);
 	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "openscreen-ort-"));
-	console.log(`Downloading ${asset}\n  from v${VERSION}`);
-	const res = await fetch(`${baseUrlFor(spec)}/${asset}`);
-	if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
-	const bytes = Buffer.from(await res.arrayBuffer());
+	const source = spec.url ?? `${baseUrlFor(spec)}/${asset}`;
+	console.log(`Downloading ${asset}\n  from ${spec.url ? "pinned URL" : `v${VERSION}`}`);
+	// curl, not fetch: some networks (the Ship's) reach hosts only through an HTTP
+	// proxy that Node's undici does not read from the environment. Reachability
+	// changes here; trust does not — the SHA-256 below is still the whole gate.
+	const proxy = process.env.HTTPS_PROXY ?? process.env.https_proxy;
+	const out = path.join(tmp, asset);
+	const args = ["-sSL", "--fail", "-o", out];
+	if (proxy) args.push("--proxy", proxy);
+	args.push(source);
+	const dl = run("curl", args);
+	if (dl.status !== 0 || !fs.existsSync(out))
+		throw new Error(`Download failed for ${asset} (curl exit ${dl.status})`);
+	const bytes = fs.readFileSync(out);
 
 	// Before opening it: is this the exact artifact we pinned?
 	const got = crypto.createHash("sha256").update(bytes).digest("hex");
@@ -378,7 +416,7 @@ async function main() {
 		// Verify BEFORE vendoring: nothing unchecked reaches electron/native/bin,
 		// where the packager would happily ship it.
 		console.log("Verifying...");
-		const banner = verify(lib, license, targetPlatform);
+		const banner = verify(lib, license, targetPlatform, spec.version ?? VERSION);
 
 		fs.mkdirSync(binDir, { recursive: true });
 		fs.copyFileSync(lib, dest);

@@ -49,8 +49,11 @@ describe("fetch-onnxruntime pins", () => {
 	it("still finds the pin table", () => {
 		expect(version, "VERSION not found in fetch-onnxruntime.mjs").toMatch(/^\d+\.\d+\.\d+$/);
 		expect(slugs.length).toBeGreaterThanOrEqual(4);
-		expect(digests).toHaveLength(slugs.length);
-		expect(tags).toHaveLength(slugs.length);
+		// Two entry shapes share the table: the templated upstream ones (`slug` +
+		// `ext`, name derived) and pinned-URL ones (`url`, like darwin-arm64's
+		// mirror or the Ship's PyPI repin for linux-x64). Every entry carries a
+		// sha256 and a target tag; only the templated ones carry a slug.
+		expect(digests).toHaveLength(tags.length);
 	});
 
 	// THE point of this file.
