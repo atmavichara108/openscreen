@@ -84,6 +84,9 @@ struct AudioMix {
     track: TrackId,
     /// Reused across drains so the steady state allocates nothing.
     scratch: Vec<f32>,
+    /// Samples mixed into the track so far — the clock the caller's "owed"
+    /// silence is measured against. See `Capture::audio_silence_owed`.
+    samples_written: usize,
 }
 
 /// How far one input may lag behind another before it is treated as silent
@@ -97,13 +100,18 @@ struct AudioMix {
 /// hear as a gap.
 const AUDIO_STARVE_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize / 4 * AUDIO_CHANNELS;
 
+/// Per-pump ceiling on catch-up silence (100 ms). A long debt — a track that
+/// produced nothing for a minute — is paid in slices, so one pump never builds
+/// an unbounded buffer; the flush pump pays the remainder.
+const SILENCE_CATCHUP_MAX_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize / 10 * AUDIO_CHANNELS;
+
 impl AudioMix {
     /// Drains every input, mixes what they have in common, and encodes it.
     ///
     /// `flush` is set once at stop: it mixes whatever remains even when the
     /// inputs are unevenly filled, because there will be no more samples to even
     /// them out.
-    fn pump(&mut self, muxer: &mut Muxer, flush: bool) -> Result<(), String> {
+    fn pump(&mut self, muxer: &mut Muxer, flush: bool, owed: usize) -> Result<(), String> {
         for input in &mut self.inputs {
             input.ring.drain_into(&mut input.pending);
         }
@@ -115,11 +123,24 @@ impl AudioMix {
         // coming — take the longest and let the short ones contribute silence,
         // rather than letting a dead input freeze the track. See
         // AUDIO_STARVE_SAMPLES.
-        let take = if flush || longest.saturating_sub(shortest) > AUDIO_STARVE_SAMPLES {
+        let base = if flush || longest.saturating_sub(shortest) > AUDIO_STARVE_SAMPLES {
             longest
         } else {
             shortest
         };
+        // THE BUG THIS FIXES (SHIP FORK, Корабль, docs/specs/recording-fragments.md):
+        // a source that never delivers a single packet (a microphone requested on
+        // a host where its node does not exist) left `shortest` at zero forever,
+        // so `take` stayed zero and NOTHING was written to the audio track — the
+        // muxer then held the fragment open waiting for audio packets to
+        // interleave, and a 10-minute take ended up as ONE fragment, which
+        // Chromium cannot seek (preview: "demuxer seek failed"). `owed` is the
+        // active-clock debt: whatever the track should have received by now but
+        // did not. It is honoured as silence every pump (bounded per pump by
+        // SILENCE_CATCHUP_MAX_SAMPLES; at flush the whole debt is paid), so the
+        // audio track spans the recording and the fragments close on schedule.
+        let owed = owed.min(if flush { usize::MAX } else { SILENCE_CATCHUP_MAX_SAMPLES });
+        let take = base.max(owed);
         if take == 0 {
             return Ok(());
         }
@@ -144,9 +165,19 @@ impl AudioMix {
 
         let id = self.track;
         let scratch = std::mem::take(&mut self.scratch);
+        self.samples_written += take;
         let result = self.encoder.push(&scratch, |packet| muxer.write(id, packet));
         self.scratch = scratch;
         result
+    }
+
+    /// The samples the track owes on the active recording clock (samples per
+    /// second of active time, minus what was already written). A positive debt
+    /// is filled with silence — see the note on `owed` in `pump`.
+    fn owed_samples(&self, elapsed: Duration) -> usize {
+        let expected =
+            (elapsed.as_secs_f64() * AUDIO_SAMPLE_RATE as f64 * AUDIO_CHANNELS as f64) as usize;
+        expected.saturating_sub(self.samples_written)
     }
 
     /// Samples the rings had to discard, per input. Audible, unlike a dropped
@@ -360,6 +391,7 @@ impl Capture {
                 encoder,
                 track,
                 scratch: Vec::new(),
+                samples_written: 0,
             })
         };
         muxer.write_header()?;
@@ -564,6 +596,9 @@ impl Capture {
         if self.paused_at.is_some() || !self.encoder.has_staged_frame() {
             return Ok(0);
         }
+        // Snapshot BEFORE the `muxer` borrow below: reading `self` afterwards
+        // would be a second immutable borrow mid-pump (E0502).
+        let owed_elapsed = self.elapsed_active();
         let target = self.current_index();
         let Some(muxer) = self.muxer.as_mut() else {
             return Ok(0);
@@ -583,7 +618,10 @@ impl Capture {
         // drops the oldest once it fills. Draining every wakeup keeps it far
         // from that cap — at 48 kHz a 16 ms tick carries about 768 samples.
         if let Some(mix) = self.audio.as_mut() {
-            mix.pump(muxer, false)?;
+            let owed = owed_elapsed
+                .map(|elapsed| mix.owed_samples(elapsed))
+                .unwrap_or(0);
+            mix.pump(muxer, false, owed)?;
         }
         Ok(written)
     }
@@ -681,8 +719,12 @@ impl Capture {
         // and draining it before the video flush keeps both ending at roughly
         // the same timestamp. `flush` lets the mix take unevenly-filled inputs,
         // since no more samples are coming to even them out.
+        let owed_elapsed = self.elapsed_active();
         if let Some(mix) = self.audio.as_mut() {
-            mix.pump(&mut muxer, true)?;
+            let owed = owed_elapsed
+                .map(|elapsed| mix.owed_samples(elapsed))
+                .unwrap_or(0);
+            mix.pump(&mut muxer, true, owed)?;
             let id = mix.track;
             mix.encoder.finish(|packet| muxer.write(id, packet))?;
         }
